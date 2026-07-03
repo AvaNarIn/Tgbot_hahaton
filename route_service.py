@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -13,6 +14,7 @@ DEFAULT_CITY = "Томск"
 GEOCODER_URL = "https://catalog.api.2gis.com/3.0/items/geocode"
 ROUTING_URL = "https://routing.api.2gis.com/routing/7.0.0/global"
 PUBLIC_TRANSPORT_URL = "https://routing.api.2gis.com/public_transport/2.0"
+logger = logging.getLogger(__name__)
 
 
 class TransportType(str, Enum):
@@ -29,19 +31,19 @@ TRANSPORT_LABELS = {
 
 
 class RouteServiceError(Exception):
-    pass
+    """Base error for route service failures."""
 
 
 class AddressNotFoundError(RouteServiceError):
-    pass
+    """Raised when 2GIS cannot find coordinates for an address."""
 
 
 class ApiLimitError(RouteServiceError):
-    pass
+    """Raised when 2GIS request limit is exceeded."""
 
 
 class ApiUnavailableError(RouteServiceError):
-    pass
+    """Raised when 2GIS is unavailable or network request fails."""
 
 
 @dataclass(frozen=True)
@@ -78,7 +80,7 @@ class RouteService:
         *,
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> Any:
         self._ensure_api_key()
         request_params = {"key": self.api_key}
         if params:
@@ -95,9 +97,20 @@ class RouteService:
                     if response.status >= 500:
                         raise ApiUnavailableError("2ГИС временно недоступен.")
 
-                    data = await response.json(content_type=None)
+                    try:
+                        data = await response.json(content_type=None)
+                    except ValueError:
+                        raise RouteServiceError("2ГИС вернул некорректный ответ.")
+
                     if response.status >= 400:
-                        message = data.get("message") or data.get("error") or "Ошибка 2ГИС."
+                        if isinstance(data, dict):
+                            message = (
+                                data.get("message")
+                                or data.get("error")
+                                or "Ошибка 2ГИС."
+                            )
+                        else:
+                            message = "Ошибка 2ГИС."
                         raise RouteServiceError(message)
                     return data
         except (aiohttp.ClientConnectionError, aiohttp.ServerTimeoutError, asyncio.TimeoutError):
@@ -106,6 +119,9 @@ class RouteService:
             raise ApiUnavailableError(f"Ошибка сети при обращении к 2ГИС: {error}")
 
     async def geocode_address(self, address: str) -> GeocodedAddress:
+        if not address.strip():
+            raise AddressNotFoundError("Адрес пустой.")
+
         data = await self._request_json(
             "GET",
             GEOCODER_URL,
@@ -114,6 +130,9 @@ class RouteService:
                 "fields": "items.point",
             },
         )
+
+        if not isinstance(data, dict):
+            raise RouteServiceError("2ГИС вернул некорректный ответ при поиске адреса.")
 
         meta_code = data.get("meta", {}).get("code")
         if meta_code == 429:
@@ -126,6 +145,9 @@ class RouteService:
             raise AddressNotFoundError("Адрес не найден.")
 
         item = items[0]
+        if not isinstance(item, dict):
+            raise AddressNotFoundError("Адрес найден, но координаты отсутствуют.")
+
         point = item.get("point") or {}
         latitude = point.get("lat")
         longitude = point.get("lon")
@@ -178,6 +200,9 @@ class RouteService:
             },
         )
 
+        if not isinstance(data, dict):
+            raise RouteServiceError("2ГИС вернул некорректный ответ при расчете маршрута.")
+
         if data.get("status") not in (None, "OK") or data.get("type") == "error":
             message = data.get("message") or "2ГИС не смог построить маршрут."
             raise RouteServiceError(message)
@@ -186,7 +211,11 @@ class RouteService:
         if not routes:
             raise RouteServiceError("2ГИС не вернул варианты маршрута.")
 
-        duration_seconds = routes[0].get("total_duration")
+        route = routes[0]
+        if not isinstance(route, dict):
+            raise RouteServiceError("2ГИС вернул некорректный маршрут.")
+
+        duration_seconds = route.get("total_duration")
         if duration_seconds is None:
             raise RouteServiceError("2ГИС не вернул время маршрута.")
 
@@ -243,7 +272,7 @@ class RouteService:
             duration_seconds = self._extract_public_transport_duration_seconds(route)
 
         if duration_seconds is None:
-            print("2GIS public transport response:", data)
+            logger.warning("2GIS public transport response: %s", data)
             raise RouteServiceError(
                 "2ГИС не вернул общее время маршрута общественного транспорта."
             )

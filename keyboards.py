@@ -55,11 +55,23 @@ def future_trip_actions_keyboard(trip_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Редактировать", callback_data=f"trip_edit:{trip_id}"
+                    text="Изменить", callback_data=f"trip_edit:{trip_id}"
                 ),
                 InlineKeyboardButton(
                     text="Удалить", callback_data=f"trip_delete:{trip_id}"
                 ),
+            ]
+        ]
+    )
+
+
+def delete_only_keyboard(trip_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Удалить", callback_data=f"trip_delete:{trip_id}"
+                )
             ]
         ]
     )
@@ -105,7 +117,7 @@ def delete_confirm_keyboard(trip_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Да, удалить", callback_data=f"delete_yes:{trip_id}"
                 ),
-                InlineKeyboardButton(text="Отмена", callback_data="delete_no"),
+                InlineKeyboardButton(text="Отмена", callback_data=f"delete_no:{trip_id}"),
             ]
         ]
     )
