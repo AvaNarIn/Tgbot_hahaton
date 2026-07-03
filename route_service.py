@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -15,6 +16,7 @@ GEOCODER_URL = "https://catalog.api.2gis.com/3.0/items/geocode"
 ROUTING_URL = "https://routing.api.2gis.com/routing/7.0.0/global"
 PUBLIC_TRANSPORT_URL = "https://routing.api.2gis.com/public_transport/2.0"
 logger = logging.getLogger(__name__)
+EXACT_ADDRESS_NOT_FOUND_MESSAGE = "Точный адрес не найден. Проверьте улицу и номер дома."
 
 
 class TransportType(str, Enum):
@@ -72,6 +74,119 @@ class RouteService:
         if DEFAULT_CITY.lower() in cleaned.lower():
             return cleaned
         return f"{DEFAULT_CITY}, {cleaned}"
+
+    def _normalize_address_text(self, value: str) -> str:
+        normalized = value.lower().replace("ё", "е")
+        normalized = re.sub(r"[.,;:()]", " ", normalized)
+        normalized = re.sub(r"\bул\b|\bулица\b", " ", normalized)
+        normalized = re.sub(r"\bпр\b|\bпроспект\b", " ", normalized)
+        normalized = re.sub(r"\bпер\b|\bпереулок\b", " ", normalized)
+        normalized = re.sub(r"\bг\b|\bгород\b", " ", normalized)
+        normalized = re.sub(r"\bдом\b|\bд\b", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()
+
+    def _extract_house_number(self, value: str) -> str | None:
+        normalized = value.lower().replace("ё", "е")
+        match = re.search(
+            r"(?:\bд\.?\s*)?(\d+[а-яa-z]?(?:[/-]\d+[а-яa-z]?)?)\b",
+            normalized,
+        )
+        return match.group(1) if match else None
+
+    def _extract_street_tokens(self, value: str) -> set[str]:
+        normalized = self._normalize_address_text(value)
+        house_number = self._extract_house_number(normalized)
+        if house_number:
+            normalized = re.sub(rf"\b{re.escape(house_number)}\b", " ", normalized)
+        normalized = normalized.replace(DEFAULT_CITY.lower(), " ")
+        return {
+            token
+            for token in normalized.split()
+            if len(token) > 1 and not token.isdigit()
+        }
+
+    def _item_text(self, item: dict[str, Any]) -> str:
+        text_parts = []
+        for field in (
+            "full_name",
+            "address_name",
+            "name",
+            "purpose_name",
+            "adm_div",
+        ):
+            value = item.get(field)
+            if isinstance(value, str):
+                text_parts.append(value)
+            elif isinstance(value, list):
+                text_parts.extend(
+                    part.get("name", "")
+                    for part in value
+                    if isinstance(part, dict)
+                )
+        return " ".join(part for part in text_parts if part)
+
+    def _item_city(self, item: dict[str, Any]) -> str:
+        adm_div = item.get("adm_div")
+        if isinstance(adm_div, list):
+            for part in adm_div:
+                if isinstance(part, dict):
+                    name = part.get("name")
+                    if isinstance(name, str) and DEFAULT_CITY.lower() in name.lower():
+                        return name
+        return self._item_text(item)
+
+    def _item_type_is_address(self, item: dict[str, Any]) -> bool:
+        known_type_fields = ("type", "subtype", "purpose_code")
+        allowed_types = {
+            "address",
+            "building",
+            "house",
+            "adm_div.building",
+        }
+        found_type = False
+
+        for field in known_type_fields:
+            value = item.get(field)
+            if not isinstance(value, str):
+                continue
+
+            found_type = True
+            normalized_value = value.lower()
+            if normalized_value in allowed_types:
+                return True
+            if any(address_type in normalized_value for address_type in allowed_types):
+                return True
+
+        return not found_type
+
+    def _is_exact_address_match(self, user_input: str, item: dict[str, Any]) -> bool:
+        if not self._item_type_is_address(item):
+            return False
+
+        point = item.get("point") or {}
+        if point.get("lat") is None or point.get("lon") is None:
+            return False
+
+        city_text = self._normalize_address_text(self._item_city(item))
+        if self._normalize_address_text(DEFAULT_CITY) not in city_text:
+            return False
+
+        user_house = self._extract_house_number(user_input)
+        if not user_house:
+            return False
+
+        item_text = self._item_text(item)
+        item_house = self._extract_house_number(item_text)
+        if item_house != user_house:
+            return False
+
+        user_street_tokens = self._extract_street_tokens(user_input)
+        item_street_tokens = self._extract_street_tokens(item_text)
+        if not user_street_tokens or not item_street_tokens:
+            return False
+
+        return user_street_tokens.issubset(item_street_tokens)
 
     async def _request_json(
         self,
@@ -142,17 +257,25 @@ class RouteService:
 
         items = data.get("result", {}).get("items") or []
         if not items:
-            raise AddressNotFoundError("Адрес не найден.")
+            raise AddressNotFoundError(EXACT_ADDRESS_NOT_FOUND_MESSAGE)
 
-        item = items[0]
-        if not isinstance(item, dict):
-            raise AddressNotFoundError("Адрес найден, но координаты отсутствуют.")
+        item = next(
+            (
+                candidate
+                for candidate in items
+                if isinstance(candidate, dict)
+                and self._is_exact_address_match(address, candidate)
+            ),
+            None,
+        )
+        if item is None:
+            raise AddressNotFoundError(EXACT_ADDRESS_NOT_FOUND_MESSAGE)
 
         point = item.get("point") or {}
         latitude = point.get("lat")
         longitude = point.get("lon")
         if latitude is None or longitude is None:
-            raise AddressNotFoundError("Адрес найден, но координаты отсутствуют.")
+            raise AddressNotFoundError(EXACT_ADDRESS_NOT_FOUND_MESSAGE)
 
         return GeocodedAddress(
             address=item.get("full_name") or item.get("address_name") or address.strip(),

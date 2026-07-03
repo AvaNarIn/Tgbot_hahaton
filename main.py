@@ -93,7 +93,7 @@ async def build_trip_text(trip) -> str:
 
 def route_error_text(error: RouteServiceError) -> str:
     if isinstance(error, AddressNotFoundError):
-        return "Адрес не найден. Проверьте адрес и попробуйте еще раз."
+        return str(error)
     if isinstance(error, ApiLimitError):
         return "Превышен лимит запросов 2ГИС. Попробуйте позже."
     if isinstance(error, ApiUnavailableError):
